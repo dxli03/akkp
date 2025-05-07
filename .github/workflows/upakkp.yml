@@ -1,0 +1,112 @@
+name: Auto Update Worker JS # 工作流程名称
+
+on:
+  push:
+    branches:
+      - main # 当推送到 main 分支时触发
+  schedule:
+    - cron: "0 1 * * *" # 每天凌晨1点运行
+  workflow_dispatch: # 允许手动触发
+    inputs:
+      force_update:
+        description: '是否强制更新（忽略版本检查）'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write # 需要写入权限来提交更改
+
+jobs:
+  update:
+    runs-on: ubuntu-latest # 使用最新的 ubuntu 环境运行
+    outputs: # 定义输出，用于提交消息
+      new_version_sha: ${{ steps.check_update.outputs.new_sha }}
+    steps:
+      - name: 检出仓库 # 第一步：检出你自己的仓库代码
+        uses: actions/checkout@v4
+
+      - name: 设置环境 # 第二步：设置后续步骤需要的环境变量
+        run: |
+          echo "SOURCE_REPO_OWNER=yonggekkk" >> $GITHUB_ENV # 源仓库的所有者
+          echo "SOURCE_REPO_NAME=Cloudflare_vless_trojan" >> $GITHUB_ENV # 源仓库的名称
+          echo "SOURCE_FILE_PATH=Vless_workers_pages/_worker.js" >> $GITHUB_ENV # 源文件在仓库中的路径
+          echo "SOURCE_BRANCH=main" >> $GITHUB_ENV # 源文件所在的分支
+          echo "TARGET_FILE=_worker.js" >> $GITHUB_ENV # 要更新到你仓库的目标文件名
+          echo "VERSION_FILE=worker_js_version.txt" >> $GITHUB_ENV # 用于存储当前 JS 文件 SHA 的版本文件名
+
+      - name: 检查并更新 Worker JS # 第三步：核心逻辑，检查并更新 JS 文件
+        id: check_update # 给这个步骤设置一个 ID，方便后续引用其输出
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 使用 GitHub 提供的 GITHUB_TOKEN 进行 API 认证
+        run: |
+          # 日志函数，方便查看时间戳
+          log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
+
+          log "开始检查更新 $TARGET_FILE..."
+
+          # 构建 GitHub Contents API URL
+          API_URL="https://api.github.com/repos/$SOURCE_REPO_OWNER/$SOURCE_REPO_NAME/contents/$SOURCE_FILE_PATH?ref=$SOURCE_BRANCH"
+          log "API URL: $API_URL"
+
+          # 获取本地存储的 SHA 版本号
+          LOCAL_SHA=$(cat $VERSION_FILE 2>/dev/null || echo "") # 如果 version 文件不存在或为空，则 LOCAL_SHA 为空
+          log "本地 SHA: ${LOCAL_SHA:-无}" # 如果 LOCAL_SHA 为空，则打印 "无"
+
+          # 获取最新的文件信息
+          log "获取最新文件信息..."
+          RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$API_URL")
+
+          if [ $? -ne 0 ]; then # 检查 curl 命令是否成功执行
+            log "错误：无法访问 GitHub API 获取文件信息"
+            exit 1 # 异常退出
+          fi
+
+          # 检查响应是否包含错误消息 (例如文件未找到)
+          if echo "$RESPONSE" | jq -e '.message' > /dev/null; then # 使用 jq 检查 JSON 中是否存在 message 字段
+            ERROR_MESSAGE=$(echo "$RESPONSE" | jq -r '.message')
+            log "错误：GitHub API 返回错误: $ERROR_MESSAGE"
+            exit 1 # 异常退出
+          fi
+
+          REMOTE_SHA=$(echo "$RESPONSE" | jq -r '.sha') # 从 API 响应中提取文件的 SHA
+          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.download_url') # 从 API 响应中提取文件的下载链接
+
+          if [ -z "$REMOTE_SHA" ] || [ "$REMOTE_SHA" == "null" ]; then # 检查是否成功获取 SHA
+            log "错误：未能从 API 响应中获取文件 SHA"
+            echo "API Response: $RESPONSE" # 打印完整的 API 响应以便调试
+            exit 1 # 异常退出
+          fi
+
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then # 检查是否成功获取下载链接
+            log "错误：未能从 API 响应中获取下载链接 ($TARGET_FILE)"
+            echo "API Response: $RESPONSE" # 打印完整的 API 响应以便调试
+            exit 1 # 异常退出
+          fi
+          log "最新 SHA: $REMOTE_SHA"
+          echo "::set-output name=new_sha::$REMOTE_SHA" # 设置输出变量 new_sha，供后续步骤使用
+
+          # 判断是否需要更新
+          FORCE_UPDATE=${{ github.event.inputs.force_update || 'false' }} # 获取手动触发时输入的 force_update 参数
+          if [ "$LOCAL_SHA" = "$REMOTE_SHA" ] && [ "$FORCE_UPDATE" != "true" ]; then # 如果本地 SHA 和远程 SHA 相同，并且不是强制更新
+            log "已是最新版本 (SHA: $LOCAL_SHA)，无需更新"
+            exit 0 # 正常退出，无需执行后续操作
+          fi
+
+          # 下载并更新文件
+          log "下载 $TARGET_FILE 从 $DOWNLOAD_URL..."
+          wget -q -O "$TARGET_FILE" "$DOWNLOAD_URL" # 使用 wget 下载文件，-q 安静模式，-O 指定输出文件名
+          if [ $? -ne 0 ]; then # 检查 wget 是否成功
+            log "错误：下载 $TARGET_FILE 失败"
+            exit 1 # 异常退出
+          fi
+
+          echo "$REMOTE_SHA" > $VERSION_FILE # 将新的 SHA 写入版本文件
+          log "更新完成，新 SHA: $REMOTE_SHA"
+
+      - name: 提交更改 # 第四步：如果文件有更新，则提交更改到你的仓库
+        if: success() && steps.check_update.outputs.new_sha != '' # 仅在前一步成功且获取到新 SHA 时执行
+        uses: stefanzweifel/git-auto-commit-action@v5 # 使用一个流行的自动提交 Action
+        with:
+          commit_message: "🔄 自动同步 Worker JS: SHA ${{ steps.check_update.outputs.new_sha }}" # 提交信息，包含新的 SHA
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>" # 提交作者信息
+          file_pattern: ${{ env.TARGET_FILE }} ${{ env.VERSION_FILE }} # 指定要提交的文件，包括更新的 JS 文件和版本文件
